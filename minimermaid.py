@@ -1,157 +1,257 @@
+from __future__ import annotations
+
 import re
-import json
-from sympy import symbols, simplify, And, Or, printing
+from dataclasses import dataclass
+
+from sympy import And, Or, Symbol
+from sympy.logic.boolalg import simplify_logic
+
+
+LEAVES = {"pk", "after", "older", "sha256", "hash256", "ripemd160", "hash160"}
+HASH_LENGTHS = {"sha256": 64, "hash256": 64, "ripemd160": 40, "hash160": 40}
+TOKEN = re.compile(r"[^(),\s]+|[(),]")
+WEIGHT = re.compile(r"\b\d+@\s*(?=[A-Za-z]\w*\s*\()")
+# Keep the SymPy expression shallow even when the policy itself is very deep.
+# Larger Boolean regions can still use their children as opaque predicates.
+FORMULA_NODE_BUDGET = 32
+
+
+@dataclass(frozen=True, eq=False)
+class Policy:
+    kind: str
+    children: tuple[Policy, ...] = ()
+    value: str | int | None = None
+
+
+def _policy(value):
+    return Policy("symbol", value=value) if isinstance(value, str) else value
+
+
+def _integer(value, function):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+        raise ValueError(f"{function} requires a non-negative integer argument")
+    return int(value)
+
+
+def _make_policy(name, args):
+    name = name.lower()
+    if name in {"and", "or"}:
+        if len(args) < 2:
+            raise ValueError(f"{name} requires at least two policies")
+        return Policy(name, tuple(map(_policy, args)))
+    if name == "thresh":
+        count = _integer(args[0], name)
+        children = tuple(map(_policy, args[1:]))
+        if not 1 <= count <= len(children):
+            raise ValueError("thresh requires a threshold between 1 and its number of policies")
+        return Policy(name, children, count)
+    if name not in LEAVES:
+        raise ValueError(f"Invalid function: {name}")
+    if len(args) != 1 or not isinstance(args[0], str):
+        raise ValueError(f"{name} requires one literal argument")
+    value = args[0]
+    if name in {"after", "older"}:
+        value = _integer(value, name)
+        if not value:
+            raise ValueError(f"{name} requires a positive integer argument")
+    elif name in HASH_LENGTHS and value.lower() != "h" and len(value) != HASH_LENGTHS[name]:
+        raise ValueError(f"{name} requires a {HASH_LENGTHS[name]}-character hash")
+    return Policy(name, value=value)
+
+
+def _parse_policy(source):
+    """Read one policy using a stack of unfinished calls."""
+    tokens = TOKEN.findall(WEIGHT.sub("", source))
+    frames = []
+    root = None
+    expecting_value = True
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if expecting_value:
+            if token in {"(", ")", ","}:
+                raise ValueError(f"Expected a policy or argument, got {token!r}")
+            if index < len(tokens) and tokens[index] == "(":
+                frames.append((token, []))
+                index += 1
+                continue
+            value = token
+        elif token == "," and frames:
+            expecting_value = True
+            continue
+        elif token == ")" and frames:
+            name, args = frames.pop()
+            value = _make_policy(name, args)
+        else:
+            raise ValueError(f"Unexpected token: {token!r}")
+
+        if frames:
+            frames[-1][1].append(value)
+        else:
+            root = _policy(value)
+        expecting_value = False
+
+    if frames:
+        raise ValueError("Missing closing parenthesis")
+    if root is None or expecting_value:
+        raise ValueError("Expected a policy")
+    return root
+
+
+def _postorder(root, children):
+    pending = [(root, False)]
+    while pending:
+        node, visited = pending.pop()
+        if visited:
+            yield node
+        else:
+            pending.append((node, True))
+            pending.extend((child, False) for child in reversed(children(node)))
+
+
+def _policy_text(root):
+    parts = []
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, str):
+            parts.append(node)
+        elif node.kind == "symbol":
+            parts.append(node.value)
+        elif not node.children:
+            parts.append(f"{node.kind}({node.value})")
+        else:
+            parts.append(f"{node.kind}(")
+            if node.kind == "thresh":
+                parts.append(f"{node.value},")
+            pending.append(")")
+            for index in range(len(node.children) - 1, -1, -1):
+                pending.append(node.children[index])
+                if index:
+                    pending.append(",")
+    return "".join(parts)
+
+
+class _Optimizer:
+    def __init__(self):
+        self.policies = {}
+        self.policy_sizes = {}
+        self.atoms = {}
+        self.symbols = {}
+
+    def intern(self, policy):
+        key = (policy.kind, policy.value, policy.children)
+        if key not in self.policies:
+            self.policies[key] = policy
+            self.policy_sizes[policy] = 1 + sum(self.policy_sizes[child] for child in policy.children)
+        return self.policies[key]
+
+    def atom(self, policy):
+        if policy not in self.atoms:
+            symbol = Symbol(f"_policy_{len(self.atoms)}")
+            self.atoms[policy] = symbol
+            self.symbols[symbol] = policy
+        return self.atoms[policy]
+
+    def expanded_size(self, formula):
+        size = 0
+        pending = [formula]
+        while pending:
+            expression = pending.pop()
+            if expression in self.symbols:
+                size += self.policy_sizes[self.symbols[expression]]
+            else:
+                size += 1
+                pending.extend(expression.args)
+        return size
+
+    def from_formula(self, formula):
+        nodes = {}
+        for expression in _postorder(formula, lambda expr: expr.args):
+            if expression in self.symbols:
+                nodes[expression] = self.symbols[expression], 1
+            else:
+                kind = "and" if expression.func == And else "or"
+                children = tuple(nodes[child] for child in expression.args)
+                nodes[expression] = (
+                    self.intern(Policy(kind, tuple(child[0] for child in children))),
+                    1 + sum(child[1] for child in children),
+                )
+        return nodes[formula]
+
+    def optimize(self, root):
+        resolved = {}
+        for node in _postorder(root, lambda policy: policy.children):
+            children = [resolved[child] for child in node.children]
+            if node.kind in {"and", "or"} or (
+                node.kind == "thresh" and node.value in {1, len(children)}
+            ):
+                use_or = node.kind == "or" or (node.kind == "thresh" and node.value == 1)
+                combine = Or if use_or else And
+                if sum(child[2] for child in children) <= FORMULA_NODE_BUDGET:
+                    formula = combine(*(child[1] for child in children))
+                    # And and Or already flatten and deduplicate a single gate.
+                    if any(not argument.is_Symbol for argument in formula.args):
+                        candidate = simplify_logic(formula)
+                        # A rewrite that is small in SymPy can duplicate large
+                        # thresholds when the opaque symbols are expanded.
+                        if self.expanded_size(candidate) <= self.expanded_size(formula):
+                            formula = candidate
+                else:
+                    formula = combine(*(self.atom(child[0]) for child in children))
+                policy, size = self.from_formula(formula)
+            else:
+                # A proper threshold remains one Boolean predicate to its parent.
+                # Preserve duplicate child slots because each slot counts.
+                policy = self.intern(Policy(node.kind, tuple(child[0] for child in children), node.value))
+                formula, size = self.atom(policy), 1
+            resolved[node] = policy, formula, size
+        return resolved[root]
 
 
 def miniscript_to_sympy(miniscript):
-    """Transform miniscript into a symbolic expression so it can simplified."""
-    if unbalanced_parentheses(miniscript):
-        raise KeyError("Missing parenthesis")
-    miniscript = miniscript.replace(' ','')
-    valid_functions = ['pk', 'after', 'older', 'sha256', 'hash256', 'ripemd160', 'hash160', 'and', 'or', 'thresh']
-    function_match = re.match(r'(\w+)\((.*)\)', miniscript)
-    if function_match:
-        function_name = function_match.group(1)
-
-        if function_name not in valid_functions:
-            raise ValueError(f"Invalid function: {function_name}")
-        function_args_str = function_match.group(2)
-        function_args = split_at_commas_outside_parentheses(function_args_str)
-        
-        if function_name in ['and', 'or']:
-            if len(function_args) != 2:
-                raise ValueError(f"Invalid number of arguments for {function_name}: {len(function_args)}")
-            left = miniscript_to_sympy(function_args[0])
-            right = miniscript_to_sympy(function_args[1])
-            return And(left, right) if function_name == 'and' else Or(left, right)
-
-        elif function_name == 'thresh':
-            threshold = int(function_args[0])
-            rest_args = function_args[1:]
-            # Equivalent to or
-            if threshold == 1:
-                args = [miniscript_to_sympy(arg) for arg in rest_args]
-                return Or(*args)
-            # Equivalent to and
-            elif threshold == len(rest_args):
-                args = [miniscript_to_sympy(arg) for arg in rest_args]
-                return And(*args)
-            # Not simplifiable
-            else:
-                keys = [miniscript_to_sympy(arg) for arg in function_args[1:]]
-                return (threshold, keys)
-
-        elif function_name in ['pk', 'after', 'older', 'sha256', 'hash256', 'ripemd160', 'hash160', 'thresh']:
-            return symbols(f"{function_name}.{function_args[0]}")
-        
+    """Represent a policy with proper thresholds as opaque Boolean symbols."""
+    optimizer = _Optimizer()
+    _, formula, _ = optimizer.optimize(_parse_policy(miniscript))
+    policies = {symbol: optimizer.symbols[symbol] for symbol in formula.free_symbols}
+    bare_names = {policy.value for policy in policies.values() if policy.kind == "symbol"}
+    names = {}
+    for symbol, policy in policies.items():
+        if policy.kind in LEAVES:
+            name = f"{policy.kind}.{policy.value}"
+            if name in bare_names:
+                name = _policy_text(policy)
         else:
-            raise ValueError(f"Unsupported function: {function_name}")
-    else:
-        return symbols(miniscript)
-
-
-def transform_policy(expression):
-    '''Make every and and or back to thresh, so it is easier to visualize in the flowchart'''
-    if isinstance(expression, list):
-        function = expression[0]
-        args = expression[1:]
-        if function == 'and':
-            return ['thresh', len(args)] + [transform_policy(arg) for arg in args]
-        elif function == 'or':
-            return ['thresh', 1] + [transform_policy(arg) for arg in args]
-        else:
-            return [function] + [transform_policy(arg) for arg in args]
-    else:
-        return expression
-
-
-def sympy_to_miniscript(expr):
-    expr_str = str(expr)
-    return expr_str.replace('&', 'and').replace('|', 'or')
-
-
-def transform_expression(expr):
-    # Find all patterns like 'Tuple(Integer(3), [pk(key_1), pk(key_2), And(older(12960), pk(key_3))])'
-    matches = re.findall(r"Tuple\(Integer\((\d+)\), \[(.+)\]\)", expr)
-
-    # For each match, replace it with 'thresh(3,pk(key_1),pk(key_2),and(pk(key_3),older(12960)))'
-    for match in matches:
-        threshold, keys = match
-        keys = keys.split(', ')
-        keys_str = ', '.join([f"{key}" for key in keys])
-        expr = expr.replace(f"Tuple(Integer({threshold}), [{keys_str}])", f"thresh({threshold}, {keys_str})")
-
-    # Find all patterns like 'Symbol('function_arg')'
-    matches = re.findall(r"Symbol\('(.*?)'\)", expr)
-
-    # For each match, replace it with 'function(arg)'
-    for match in matches:
-        if '.' in match:
-            function, arg = match.split('.')
-            expr = expr.replace(f"Symbol('{function}.{arg}')", f"{function}({arg})")
-        else:
-            expr = expr.replace(f"Symbol('{match}')", f"{match}")
-
-    return expr
+            name = _policy_text(policy)
+        names[symbol] = Symbol(name)
+    return formula.xreplace(names)
 
 
 def simplify_miniscript(miniscript):
-    sympy_expr = miniscript_to_sympy(miniscript)
-    simplified_sympy_expr = simplify(sympy_expr)
-    simplified_miniscript = printing.repr.srepr(simplified_sympy_expr)
-    simple_miniscript = transform_expression(simplified_miniscript)
-    return simple_miniscript.lower()
+    policy, _, _ = _Optimizer().optimize(_parse_policy(miniscript))
+    return _policy_text(policy)
+
+
+def _policy_json(root):
+    values = {}
+    for node in _postorder(root, lambda policy: policy.children):
+        if node.kind == "symbol":
+            values[node] = node.value
+        elif node.kind == "thresh":
+            values[node] = {
+                "thresh": {"num": node.value, "subpolicies": [values[child] for child in node.children]}
+            }
+        elif node.kind in {"and", "or"}:
+            values[node] = {node.kind: [values[child] for child in node.children]}
+        else:
+            values[node] = {node.kind: [node.value]}
+    return values[root]
 
 
 def miniscript_to_json(miniscript):
-    """Transform miniscript into json so it can be easily manipulated."""
-    if unbalanced_parentheses(miniscript):
-        raise KeyError("Missing parenthesis")
-    miniscript = miniscript.lower().replace(' ', '').replace('(h)', '(H)')
-    valid_functions = ['pk', 'after', 'older', 'sha256', 'hash256', 'ripemd160', 'hash160', 'and', 'or', 'thresh', 'symbol']
-    function_match = re.match(r'(\w+)\((.*)\)', miniscript)
-    if function_match:
-        function_name = function_match.group(1)
-        
-        if function_name not in valid_functions:
-            raise ValueError(f"Invalid function: {function_name}")
-        function_args_str = function_match.group(2)
-        function_args = split_at_commas_outside_parentheses(function_args_str)
-
-        if function_name in ['sha256', 'hash256']:
-            h = (function_args[0])
-            if len(function_args[0]) != 64 and function_args[0] != 'H':
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [h]}
-        
-        elif function_name in ['ripemd160', 'hash160']:
-            h = (function_args[0])
-            if len(function_args[0]) != 40 and function_args[0] != 'H':
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [h]}
-        
-        elif function_name in ['after', 'older']:
-            timing = int(function_args[0])
-            if int(function_args[0]) == 0:
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [timing]}
-        
-        elif function_name == 'thresh':
-            num = int(function_args[0])
-            if num < 1 or num > len(function_args) - 1:
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            subpolicies = [miniscript_to_json(arg) for arg in function_args[1:]]
-            return {function_name: {'num': num, 'subpolicies': subpolicies}}
-        
-        elif function_name in ['and', 'or']:
-            subpolicies = [miniscript_to_json(arg) for arg in function_args]
-            
-            return {function_name: subpolicies}
-        
-        else:
-            return {function_name: [miniscript_to_json(arg) if '(' in arg else arg for arg in function_args]}
-    else:
-        return miniscript
+    """Parse a policy into the JSON-compatible tree used by the renderer."""
+    return _policy_json(_parse_policy(miniscript))
 
 
 def split_at_commas_outside_parentheses(s):
@@ -232,72 +332,98 @@ def merge_or_nodes(node):
     return node
 
 
-def json_to_mermaid(json_data, parent=None, depth=0, key_counter={}, min_check=1, tot_check=1):
-    """Transform miniscript in json format to mermaid flowchart"""
-    key_counter = {} if key_counter is None else key_counter
-    mermaid_code = "graph TD\n" if depth==0 else ""
-    if isinstance(json_data, dict):
-        for key, value in json_data.items():
-            if key in key_counter:
-                key_counter[key] += 1
+def _mermaid_label(value):
+    """Encode delimiter and markup characters using Mermaid entities."""
+    special = '#"&<>`|\\[]{}()'
+    return ''.join(
+        f'#{ord(character)};' if character in special or ord(character) < 32 else character
+        for character in str(value)
+    )
+
+
+def json_to_mermaid(json_data, parent=None, depth=0, key_counter=None, min_check=1, tot_check=1):
+    """Render one policy tree as Mermaid, visiting child slots in input order."""
+    counters = {} if key_counter is None else key_counter
+
+    def next_id(prefix):
+        counters[prefix] = counters.get(prefix, -1) + 1
+        node_id = f'{prefix}_{counters[prefix]}'
+        if node_id == parent:
+            counters[prefix] += 1
+            node_id = f'{prefix}_{counters[prefix]}'
+        return node_id
+
+    lines = ['graph TD'] if not depth else []
+    policies = json_data if isinstance(json_data, list) and parent is not None else [json_data]
+    pending = [(policy, parent) for policy in reversed(policies)]
+    root = None
+    while pending:
+        policy, target = pending.pop()
+        if isinstance(policy, str):
+            operator, value = None, [policy]
+        elif isinstance(policy, dict) and len(policy) == 1:
+            operator, value = next(iter(policy.items()))
+        else:
+            raise ValueError('Expected a policy string or a single-operation object')
+
+        if operator in ('and', 'or', 'thresh'):
+            if operator == 'thresh' and (not isinstance(value, dict) or {'num', 'subpolicies'} - value.keys()):
+                raise ValueError('Expected a threshold with num and subpolicies')
+            children = value['subpolicies'] if operator == 'thresh' else value
+            if not isinstance(children, list):
+                raise ValueError('Expected gate children as a list')
+            required = len(children) if operator == 'and' else 1
+            if operator == 'thresh':
+                required = value['num']
+            if type(required) is not int or not 1 <= required <= len(children):
+                raise ValueError('Expected a threshold between 1 and the number of policies')
+            gate = next_id(operator)
+            lines.append(f'{gate}{{Check {required}/{len(children)}}}')
+            if target is None:
+                root = gate
             else:
-                key_counter[key] = 0
-            new_key = f"{key}_{key_counter[key]}"
+                lines.append(f'{gate} --> {target}')
+            pending.extend((child, gate) for child in reversed(children))
+            continue
 
-            if key in ['and', 'or']:
-                tot_check = len(value)
-                if key == 'and':
-                    min_check = tot_check
-                elif key == 'or':
-                    min_check = 1 
-                mermaid_code += json_to_mermaid(value, new_key, depth+1, key_counter=key_counter,min_check=min_check,tot_check=tot_check)
-                if depth:
-                    mermaid_code += f"{new_key} --> {parent}\n"
-                mermaid_code += f"{new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
+        if operator is not None and operator not in LEAVES:
+            raise ValueError(f'Invalid leaf function: {operator}')
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], (str, int)):
+            raise ValueError('Expected a single text or integer leaf value')
+        if target is None:
+            if type(min_check) is not int or type(tot_check) is not int:
+                raise ValueError('Expected integer check counts')
+            target = root = next_id('check')
+            lines.append(f'{target}{{Check {min_check}/{tot_check}}}')
+        leaf = next_id('leaf')
+        lines.append(f'{leaf}["{_mermaid_label(value[0])}"]')
+        edge_label = f'|{_mermaid_label(operator)}|' if operator is not None else ''
+        lines.append(f'{leaf} -->{edge_label} {target}')
 
-            elif key == 'thresh':
-                min_check = value['num']
-                tot_check = len(value['subpolicies'])
-                for item in value['subpolicies']:
-                    mermaid_code += json_to_mermaid(item, new_key, depth + 1, key_counter=key_counter, min_check=min_check, tot_check=tot_check)
-                if depth:
-                    mermaid_code += f"{new_key} --> {parent}\n"
-                mermaid_code += f"{new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
-
-            if key in ['pk', 'older', 'after', 'hash160', 'sha256', 'hash256', 'ripemd160']: 
-                if tot_check == 1:
-                    pass
-                mermaid_code += f"{value[0]} -->|{key}| {parent if parent else new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
-
-    elif isinstance(json_data, list):
-        for item in json_data:
-            mermaid_code += json_to_mermaid(item, parent, depth, key_counter=key_counter,min_check=min_check,tot_check=tot_check)
-    
-    mermaid_code += f"{new_key} -->|yes|s((spend))\n{new_key} -->|no|n((nothing))" if not depth else ''
-
-    return mermaid_code
+    if not depth and root is not None:
+        lines.extend((f'{root} -->|yes|s((spend))', f'{root} -->|no|n((nothing))'))
+    graph = '\n'.join(lines)
+    return graph + '\n' if lines and (depth or parent is not None) else graph
 
 
-def unbalanced_parentheses(s):
-   stack = []
-   for char in s:
-       if char == '(':
-           stack.append(char)
-       elif char == ')':
-           if not stack:
-               return False
-           stack.pop()
-   return not not stack
+def unbalanced_parentheses(source):
+    depth = 0
+    for character in source:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0
 
 
-def miniscript_to_mermaid(miniscript,simp=True):
-    """Uses helper functions to go from miniscript to mermaid flowchart with or without simplification."""
-    # Removing likeleness while we don't know how to deal with it
-    miniscript = re.sub(r'\d+@', '', miniscript)
+def miniscript_to_mermaid(miniscript, simp=True):
+    """Render a policy, optionally simplifying its Boolean expressions."""
+    policy = _parse_policy(miniscript)
     if simp:
-        miniscript = simplify_miniscript(miniscript)
-    json_obj = miniscript_to_json(miniscript)
-    return json_to_mermaid(json_obj)
+        policy, _, _ = _Optimizer().optimize(policy)
+    return json_to_mermaid(_policy_json(policy))
 
 
 if __name__ == '__main__':
