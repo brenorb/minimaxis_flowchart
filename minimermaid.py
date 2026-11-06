@@ -191,11 +191,13 @@ class _Optimizer:
                 combine = Or if use_or else And
                 if sum(child[2] for child in children) <= FORMULA_NODE_BUDGET:
                     formula = combine(*(child[1] for child in children))
-                    candidate = simplify_logic(formula)
-                    # A rewrite that is small in SymPy can duplicate large
-                    # thresholds when the opaque symbols are expanded.
-                    if self.expanded_size(candidate) <= self.expanded_size(formula):
-                        formula = candidate
+                    # And and Or already flatten and deduplicate a single gate.
+                    if any(not argument.is_Symbol for argument in formula.args):
+                        candidate = simplify_logic(formula)
+                        # A rewrite that is small in SymPy can duplicate large
+                        # thresholds when the opaque symbols are expanded.
+                        if self.expanded_size(candidate) <= self.expanded_size(formula):
+                            formula = candidate
                 else:
                     formula = combine(*(self.atom(child[0]) for child in children))
                 policy, size = self.from_formula(formula)
