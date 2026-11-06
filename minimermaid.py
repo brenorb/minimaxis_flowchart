@@ -228,55 +228,25 @@ def simplify_miniscript(miniscript):
     return _policy_text(policy)
 
 
-def miniscript_to_json(miniscript):
-    """Transform miniscript into json so it can be easily manipulated."""
-    if unbalanced_parentheses(miniscript):
-        raise KeyError("Missing parenthesis")
-    miniscript = miniscript.lower().replace(' ', '').replace('(h)', '(H)')
-    valid_functions = ['pk', 'after', 'older', 'sha256', 'hash256', 'ripemd160', 'hash160', 'and', 'or', 'thresh', 'symbol']
-    function_match = re.match(r'(\w+)\((.*)\)', miniscript)
-    if function_match:
-        function_name = function_match.group(1)
-        
-        if function_name not in valid_functions:
-            raise ValueError(f"Invalid function: {function_name}")
-        function_args_str = function_match.group(2)
-        function_args = split_at_commas_outside_parentheses(function_args_str)
-
-        if function_name in ['sha256', 'hash256']:
-            h = (function_args[0])
-            if len(function_args[0]) != 64 and function_args[0] != 'H':
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [h]}
-        
-        elif function_name in ['ripemd160', 'hash160']:
-            h = (function_args[0])
-            if len(function_args[0]) != 40 and function_args[0] != 'H':
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [h]}
-        
-        elif function_name in ['after', 'older']:
-            timing = int(function_args[0])
-            if int(function_args[0]) == 0:
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            return {function_name: [timing]}
-        
-        elif function_name == 'thresh':
-            num = int(function_args[0])
-            if num < 1 or num > len(function_args) - 1:
-                raise ValueError(f"Invalid argument for {function_name}: {function_args[0]}")
-            subpolicies = [miniscript_to_json(arg) for arg in function_args[1:]]
-            return {function_name: {'num': num, 'subpolicies': subpolicies}}
-        
-        elif function_name in ['and', 'or']:
-            subpolicies = [miniscript_to_json(arg) for arg in function_args]
-            
-            return {function_name: subpolicies}
-        
+def _policy_json(root):
+    values = {}
+    for node in _postorder(root, lambda policy: policy.children):
+        if node.kind == "symbol":
+            values[node] = node.value
+        elif node.kind == "thresh":
+            values[node] = {
+                "thresh": {"num": node.value, "subpolicies": [values[child] for child in node.children]}
+            }
+        elif node.kind in {"and", "or"}:
+            values[node] = {node.kind: [values[child] for child in node.children]}
         else:
-            return {function_name: [miniscript_to_json(arg) if '(' in arg else arg for arg in function_args]}
-    else:
-        return miniscript
+            values[node] = {node.kind: [node.value]}
+    return values[root]
+
+
+def miniscript_to_json(miniscript):
+    """Parse a policy into the JSON-compatible tree used by the renderer."""
+    return _policy_json(_parse_policy(miniscript))
 
 
 def split_at_commas_outside_parentheses(s):
@@ -357,72 +327,98 @@ def merge_or_nodes(node):
     return node
 
 
-def json_to_mermaid(json_data, parent=None, depth=0, key_counter={}, min_check=1, tot_check=1):
-    """Transform miniscript in json format to mermaid flowchart"""
-    key_counter = {} if key_counter is None else key_counter
-    mermaid_code = "graph TD\n" if depth==0 else ""
-    if isinstance(json_data, dict):
-        for key, value in json_data.items():
-            if key in key_counter:
-                key_counter[key] += 1
+def _mermaid_label(value):
+    """Encode delimiter and markup characters using Mermaid entities."""
+    special = '#"&<>`|\\[]{}()'
+    return ''.join(
+        f'#{ord(character)};' if character in special or ord(character) < 32 else character
+        for character in str(value)
+    )
+
+
+def json_to_mermaid(json_data, parent=None, depth=0, key_counter=None, min_check=1, tot_check=1):
+    """Render one policy tree as Mermaid, visiting child slots in input order."""
+    counters = {} if key_counter is None else key_counter
+
+    def next_id(prefix):
+        counters[prefix] = counters.get(prefix, -1) + 1
+        node_id = f'{prefix}_{counters[prefix]}'
+        if node_id == parent:
+            counters[prefix] += 1
+            node_id = f'{prefix}_{counters[prefix]}'
+        return node_id
+
+    lines = ['graph TD'] if not depth else []
+    policies = json_data if isinstance(json_data, list) and parent is not None else [json_data]
+    pending = [(policy, parent) for policy in reversed(policies)]
+    root = None
+    while pending:
+        policy, target = pending.pop()
+        if isinstance(policy, str):
+            operator, value = None, [policy]
+        elif isinstance(policy, dict) and len(policy) == 1:
+            operator, value = next(iter(policy.items()))
+        else:
+            raise ValueError('Expected a policy string or a single-operation object')
+
+        if operator in ('and', 'or', 'thresh'):
+            if operator == 'thresh' and (not isinstance(value, dict) or {'num', 'subpolicies'} - value.keys()):
+                raise ValueError('Expected a threshold with num and subpolicies')
+            children = value['subpolicies'] if operator == 'thresh' else value
+            if not isinstance(children, list):
+                raise ValueError('Expected gate children as a list')
+            required = len(children) if operator == 'and' else 1
+            if operator == 'thresh':
+                required = value['num']
+            if type(required) is not int or not 1 <= required <= len(children):
+                raise ValueError('Expected a threshold between 1 and the number of policies')
+            gate = next_id(operator)
+            lines.append(f'{gate}{{Check {required}/{len(children)}}}')
+            if target is None:
+                root = gate
             else:
-                key_counter[key] = 0
-            new_key = f"{key}_{key_counter[key]}"
+                lines.append(f'{gate} --> {target}')
+            pending.extend((child, gate) for child in reversed(children))
+            continue
 
-            if key in ['and', 'or']:
-                tot_check = len(value)
-                if key == 'and':
-                    min_check = tot_check
-                elif key == 'or':
-                    min_check = 1 
-                mermaid_code += json_to_mermaid(value, new_key, depth+1, key_counter=key_counter,min_check=min_check,tot_check=tot_check)
-                if depth:
-                    mermaid_code += f"{new_key} --> {parent}\n"
-                mermaid_code += f"{new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
+        if operator is not None and operator not in LEAVES:
+            raise ValueError(f'Invalid leaf function: {operator}')
+        if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], (str, int)):
+            raise ValueError('Expected a single text or integer leaf value')
+        if target is None:
+            if type(min_check) is not int or type(tot_check) is not int:
+                raise ValueError('Expected integer check counts')
+            target = root = next_id('check')
+            lines.append(f'{target}{{Check {min_check}/{tot_check}}}')
+        leaf = next_id('leaf')
+        lines.append(f'{leaf}["{_mermaid_label(value[0])}"]')
+        edge_label = f'|{_mermaid_label(operator)}|' if operator is not None else ''
+        lines.append(f'{leaf} -->{edge_label} {target}')
 
-            elif key == 'thresh':
-                min_check = value['num']
-                tot_check = len(value['subpolicies'])
-                for item in value['subpolicies']:
-                    mermaid_code += json_to_mermaid(item, new_key, depth + 1, key_counter=key_counter, min_check=min_check, tot_check=tot_check)
-                if depth:
-                    mermaid_code += f"{new_key} --> {parent}\n"
-                mermaid_code += f"{new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
-
-            if key in ['pk', 'older', 'after', 'hash160', 'sha256', 'hash256', 'ripemd160']: 
-                if tot_check == 1:
-                    pass
-                mermaid_code += f"{value[0]} -->|{key}| {parent if parent else new_key}{{{'Check {}/{}'.format(min_check, tot_check)}}}\n"
-
-    elif isinstance(json_data, list):
-        for item in json_data:
-            mermaid_code += json_to_mermaid(item, parent, depth, key_counter=key_counter,min_check=min_check,tot_check=tot_check)
-    
-    mermaid_code += f"{new_key} -->|yes|s((spend))\n{new_key} -->|no|n((nothing))" if not depth else ''
-
-    return mermaid_code
+    if not depth and root is not None:
+        lines.extend((f'{root} -->|yes|s((spend))', f'{root} -->|no|n((nothing))'))
+    graph = '\n'.join(lines)
+    return graph + '\n' if lines and (depth or parent is not None) else graph
 
 
-def unbalanced_parentheses(s):
-   stack = []
-   for char in s:
-       if char == '(':
-           stack.append(char)
-       elif char == ')':
-           if not stack:
-               return False
-           stack.pop()
-   return not not stack
+def unbalanced_parentheses(source):
+    depth = 0
+    for character in source:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0
 
 
-def miniscript_to_mermaid(miniscript,simp=True):
-    """Uses helper functions to go from miniscript to mermaid flowchart with or without simplification."""
-    # Removing likeleness while we don't know how to deal with it
-    miniscript = re.sub(r'\d+@', '', miniscript)
+def miniscript_to_mermaid(miniscript, simp=True):
+    """Render a policy, optionally simplifying its Boolean expressions."""
+    policy = _parse_policy(miniscript)
     if simp:
-        miniscript = simplify_miniscript(miniscript)
-    json_obj = miniscript_to_json(miniscript)
-    return json_to_mermaid(json_obj)
+        policy, _, _ = _Optimizer().optimize(policy)
+    return json_to_mermaid(_policy_json(policy))
 
 
 if __name__ == '__main__':
