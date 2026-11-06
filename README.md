@@ -1,60 +1,44 @@
 # minimaxis_flowchart
-🤏🧜‍♀️ Visualize Miniscript using Mermaid
 
-![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen)
+🤏🧜‍♀️ Visualize Miniscript policies using Mermaid.
+
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-## 🌐 Introduction
+## Setup
 
-Flowchart for Miniscripts
-This is a small suite of tools aimed to work with Miniscript. 
+From the repository directory, install the dependency into a virtual environment.
 
-## 📂 Project File Tree
-
-minimaxis_flowchart
-├── minimermaid.py
-
-
-#### minimaxis_flowchart
-
-- minimermaid.py
-    - Application flowchart for MiniScripts.
- 
-## 🛠 Tech Stack
-
-### Technology
-- Python
-
-### External Packages 
-- re
-- json
-- symbols, simplify, And, Or, printing
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
 ## Usage
 
 ```python
-miniscript = 'or(pk(key_revocation),and(pk(key_remote),or(and(pk(key_local),hash160(H)),older(1008))))'
-miniscript_to_mermaid(miniscript, True) # True for readability improvement through simplification,
-                                        # False for auditability improvement through replication.
+from minimermaid import miniscript_to_mermaid
 
-### Output: ###
-# graph TD
-# key_revocation -->|pk| or_0{Check 1/3}
-# 1008 -->|older| and_0{Check 2/2}
-# key_remote -->|pk| and_0{Check 2/2}
-# and_0 --> or_0
-# and_0{Check 2/2}
-# H -->|hash160| and_1{Check 3/3}
-# key_local -->|pk| and_1{Check 3/3}
-# key_remote -->|pk| and_1{Check 3/3}
-# and_1 --> or_0
-# and_1{Check 3/3}
-# or_0{Check 1/3}
-# or_0 -->|yes|s((spend))
-# or_0 -->|no|n((nothing))
+policy = "or(pk(Recovery),thresh(2,pk(Alice),pk(Bob),thresh(2,pk(Carol),pk(Dave),older(1008))))"
+print(miniscript_to_mermaid(policy))
+```
+
+Pass `simp=False` to keep the input's gate structure and operand order for auditing.
+By default, the converter simplifies Boolean expressions, including those inside
+nested thresholds. A threshold retains a separate vote for each operand slot,
+even when two slots have the same predicate.
+
+The converter accepts the policy functions `and`, `or`, `thresh`, `pk`, `after`,
+`older`, `sha256`, `hash256`, `ripemd160`, and `hash160`. Probability weights such
+as `9@pk(Alice)` are ignored when drawing the policy. The output is Mermaid graph
+source that can be pasted into a Mermaid editor.
+
+## Tests
+
+```sh
+python -m unittest discover -s tests -v
 ```
 
 ## Contributing
 
-Pull requests are welcome. For major changes, please open an issue first
-to discuss what you would like to change.
+Pull requests are welcome. For major changes, open an issue first to discuss the proposal.
