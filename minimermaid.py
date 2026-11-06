@@ -212,11 +212,14 @@ def miniscript_to_sympy(miniscript):
     """Represent a policy with proper thresholds as opaque Boolean symbols."""
     optimizer = _Optimizer()
     _, formula, _ = optimizer.optimize(_parse_policy(miniscript))
+    policies = {symbol: optimizer.symbols[symbol] for symbol in formula.free_symbols}
+    bare_names = {policy.value for policy in policies.values() if policy.kind == "symbol"}
     names = {}
-    for symbol in formula.free_symbols:
-        policy = optimizer.symbols[symbol]
+    for symbol, policy in policies.items():
         if policy.kind in LEAVES:
             name = f"{policy.kind}.{policy.value}"
+            if name in bare_names:
+                name = _policy_text(policy)
         else:
             name = _policy_text(policy)
         names[symbol] = Symbol(name)

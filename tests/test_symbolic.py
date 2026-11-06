@@ -51,6 +51,10 @@ class SymbolicThresholdTests(unittest.TestCase):
         expression = miniscript_to_sympy(source)
         self.assertEqual(expression, And(Symbol("pk.C"), Symbol("pk.A") | Symbol("pk.B")))
 
+    def test_a_bare_symbol_cannot_alias_a_typed_predicate(self):
+        expression = miniscript_to_sympy("and(pk(Alice),pk.Alice)")
+        self.assertEqual(expression, And(Symbol("pk(Alice)"), Symbol("pk.Alice")))
+
 
 if __name__ == "__main__":
     unittest.main()
